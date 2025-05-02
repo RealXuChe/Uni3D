@@ -105,10 +105,10 @@ class Group(nn.Module):
         '''
         batch_size, num_points, _ = xyz.shape
         # fps the centers out
-        center = fps(xyz, self.num_group) # B G 3
+        center = fps(xyz, self.num_group) # B G 3 512,3
         # knn to get the neighborhood
         # _, idx = self.knn(xyz, center) # B G M
-        idx = knn_point(self.group_size, xyz, center) # B G M
+        idx = knn_point(self.group_size, xyz, center) # B G M   12,512,64
         assert idx.size(1) == self.num_group
         assert idx.size(2) == self.group_size
         idx_base = torch.arange(0, batch_size, device=xyz.device).view(-1, 1, 1) * num_points
@@ -116,7 +116,7 @@ class Group(nn.Module):
         idx = idx.view(-1)
         neighborhood = xyz.view(batch_size * num_points, -1)[idx, :]
         neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3).contiguous()
-
+        # 12,512,64,3
         neighborhood_color = color.view(batch_size * num_points, -1)[idx, :]
         neighborhood_color = neighborhood_color.view(batch_size, self.num_group, self.group_size, 3).contiguous()
 
@@ -124,7 +124,7 @@ class Group(nn.Module):
         neighborhood = neighborhood - center.unsqueeze(2)
 
         features = torch.cat((neighborhood, neighborhood_color), dim=-1)
-        return neighborhood, center, features
+        return neighborhood, center, features #12,512,64,6
 
 class Encoder(nn.Module):
     def __init__(self, encoder_channel):
@@ -151,25 +151,25 @@ class Encoder(nn.Module):
         bs, g, n , _ = point_groups.shape
         point_groups = point_groups.reshape(bs * g, n, 6)
         # encoder
-        feature = self.first_conv(point_groups.transpose(2,1))  # BG 256 n
-        feature_global = torch.max(feature,dim=2,keepdim=True)[0]  # BG 256 1
-        feature = torch.cat([feature_global.expand(-1,-1,n), feature], dim=1)# BG 512 n
-        feature = self.second_conv(feature) # BG 1024 n
-        feature_global = torch.max(feature, dim=2, keepdim=False)[0] # BG 1024
+        feature = self.first_conv(point_groups.transpose(2, 1))  # BG 512 64
+        feature_global = torch.max(feature, dim=2, keepdim=True)[0]  # BG 512 1
+        feature = torch.cat([feature_global.expand(-1, -1, n), feature], dim=1)  # BG 512 64
+        feature = self.second_conv(feature)  # BG 1024 64
+        feature_global = torch.max(feature, dim=2, keepdim=False)[0]  # BG 12 512
         return feature_global.reshape(bs, g, self.encoder_channel)
 
 class PointcloudEncoder(nn.Module):
-    def __init__(self, point_transformer, args):
+    def __init__(self, point_transformer):
         super().__init__()
         from easydict import EasyDict
-        self.trans_dim = args.pc_feat_dim # 768
-        self.embed_dim = args.embed_dim # 512
-        self.group_size = args.group_size # 32
-        self.num_group = args.num_group # 512
+        self.trans_dim = 768  # args.pc_feat_dim # 768
+        self.embed_dim = 1024  # args.embed_dim # 512
+        self.group_size = 32  # args.group_size # 32
+        self.num_group = 512  # args.num_group # 512
         # grouper
-        self.group_divider = Group(num_group = self.num_group, group_size = self.group_size)
+        self.group_divider = Group(num_group=self.num_group, group_size=self.group_size)  # 12,512,4,6
         # define the encoder
-        self.encoder_dim =  args.pc_encoder_dim # 256
+        self.encoder_dim = 512  # args.pc_encoder_dim # 256
         self.encoder = Encoder(encoder_channel = self.encoder_dim)
        
         # bridge encoder and transformer
@@ -184,9 +184,10 @@ class PointcloudEncoder(nn.Module):
             nn.Linear(3, 128),
             nn.GELU(),
             nn.Linear(128, self.trans_dim)
-        )  
+        )
+        dr = 0
         # setting a patch_dropout of 0. would mean it is disabled and this function would be the identity fn
-        self.patch_dropout = PatchDropout(args.patch_dropout) if args.patch_dropout > 0. else nn.Identity()
+        self.patch_dropout = PatchDropout(dr) if dr > 0. else nn.Identity()
         self.visual = point_transformer
 
 
@@ -195,11 +196,11 @@ class PointcloudEncoder(nn.Module):
         _, center, features = self.group_divider(pts, colors)
 
         # encoder the input cloud patches
-        group_input_tokens = self.encoder(features)  #  B G N
-        group_input_tokens = self.encoder2trans(group_input_tokens)
+        group_input_tokens = self.encoder(features)  # batch group encoder_dim
+        group_input_tokens = self.encoder2trans(group_input_tokens)  # 12,512 768 batch group pc_feat_dim
         # prepare cls
-        cls_tokens = self.cls_token.expand(group_input_tokens.size(0), -1, -1)  
-        cls_pos = self.cls_pos.expand(group_input_tokens.size(0), -1, -1)  
+        cls_tokens = self.cls_token.expand(group_input_tokens.size(0), -1, -1)  # 全局特征
+        cls_pos = self.cls_pos.expand(group_input_tokens.size(0), -1, -1)  # 位置
         # add pos embedding
         pos = self.pos_embed(center)
         # final input
@@ -215,10 +216,27 @@ class PointcloudEncoder(nn.Module):
         x = self.visual.pos_drop(x)
 
         # ModuleList not support forward
+        features = {}
         for i, blk in enumerate(self.visual.blocks):
             x = blk(x)
-        x = self.visual.norm(x[:, 0, :])
-        x = self.visual.fc_norm(x)
+            if i == 3:
+                features['h4'] = x
+            elif i == 7:
+                features['h8'] = x
 
-        x = self.trans2embed(x)
-        return x
+        features['h_last'] = x
+
+        h4 = self.visual.norm(features['h4'])
+        h8 = self.visual.norm(features['h8'])
+        h_last = self.visual.norm(features['h_last'])
+
+        h4 = h4[:, 1:, :]
+        h8 = h8[:, 1:, :]
+        h12 = h_last[:, 1:, :]
+
+        center_level_0 = pts.permute(0,2,1)
+        center_level_1 = fps(pts, 1536).transpose(-1, -2).contiguous()
+        center_level_2 = fps(pts, 1024).transpose(-1, -2).contiguous()
+        center_level_3 = center.transpose(-1, -2).contiguous()
+
+        return h4,h8,h12,pts,center_level_0,center_level_1,center_level_2,center_level_3
